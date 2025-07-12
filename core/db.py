@@ -11,5 +11,5 @@ except Exception as e:
     sys.exit(1)
 db = client["mcp-server"]
 
-collection = db["users"]
-
+user_collection = db["users"]
+project_collection = db["projects"]

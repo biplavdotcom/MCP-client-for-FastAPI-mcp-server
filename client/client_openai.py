@@ -11,7 +11,6 @@ from mcp import ClientSession
 # from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -90,7 +89,6 @@ class MCPClient:
                 }
             } for tool in response.tools]
         
-        # Initialize Claude API call
         # print(f"Sending query to {model}...")
         response = self.openai.chat.completions.create(
             model=model,

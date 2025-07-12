@@ -9,16 +9,24 @@ from mcp.client.sse import sse_client
 
 from google import genai
 from google.genai import types as genai_types
-
+import aiohttp
+import requests
 from dotenv import load_dotenv
+import pika
+import json
 
 load_dotenv()
+
 
 class MCPClient:
     def __init__(self):
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
         self.gemini = genai.Client()
+        self.rabbit_connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+        self.rabbit_channel = self.rabbit_connection.channel()
+        self.rabbit_channel.queue_declare(queue="tool_args")
+        self.pending_tool_args: dict = {}
 
     async def connect_to_sse_server(self, server_url: str):
         """Connect to an SSE MCP server.
@@ -41,7 +49,49 @@ class MCPClient:
         tools = response.tools
         print(f"Connected to SSE MCP Server at {server_url}. Available tools: {[tool.name for tool in tools]}")
 
-
+    def login_creds(self, data: dict):
+        try:
+            required_fields = ["email", "password"]
+            if not all(field in data for field in required_fields):
+                print(f"Missig required fields:")
+                return False
+            
+            response = requests.post("http://localhost:8000/creds_login", json=data)
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"Error pushing credentials: {e}")
+            return False
+        
+    def signup_creds(self, data: dict):
+        try:
+            required_fields = ["name", "email", "password", "re_password"]
+            if not all(field in data for field in required_fields):
+                print(f"Missig required fields:")
+                return False
+            if data["password"] != data["re_password"]:
+                print("Passwords do not match")
+                return False
+            response = requests.post("http://localhost:8000/creds_signup", json=data)
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"Error pushing credentials: {e}")
+            return False
+        
+    def project_info(self, data: dict):
+        try:
+            required_fields = ["project_name", "project_description"]
+            if not all(field in data for field in required_fields):
+                print(f"Missig required fields:")
+                return False
+            response = requests.post("http://localhost:8000/create-project", json=data)
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"Error pushing credentials: {e}")
+            return False    
+    
     async def connect_to_server(self, server_path_or_url: str):
         """Connect to an MCP server (either stdio or SSE).
         
@@ -57,7 +107,7 @@ class MCPClient:
         else:
             # It's a script path, connect to stdio server
             await self.connect_to_stdio_server(server_path_or_url)
-
+    
     async def process_query(self, query: str, previous_messages: list = None) -> tuple[str, list]:
         """Process a query using the MCP server and available tools.
         
@@ -132,6 +182,8 @@ class MCPClient:
             "array": "ARRAY",
             "object": "OBJECT",
         }
+
+
 
         gemini_tools = []
         for tool in available_tools:
@@ -208,7 +260,14 @@ class MCPClient:
                 
                 # Parse tool arguments
                 tool_args = self._parse_gemini_function_args(function_call)
-                    
+
+                if tool_name == "signup" :
+                    self.signup_creds(tool_args)   
+                elif tool_name == "login":
+                    self.login_creds(tool_args)
+                elif tool_name == "create_project":
+                    self.project_info(tool_args)
+
                 # Add function call info to response
                 function_call_text = f"I need to call the {tool_name} function to help with your request."
                 final_text.append(function_call_text)
@@ -233,13 +292,20 @@ class MCPClient:
                 
         return final_text, messages
     
+    def tool_args_to_queue_in_string(self, tool_args: dict):
+            payload = json.dumps(tool_args)
+            self.rabbit_channel.basic_publish(exchange="", routing_key="tool_args", body=payload)
+    
     def _parse_gemini_function_args(self, function_call):
         """Parse function arguments from Gemini function call."""
         tool_args = {}
         try:
             if hasattr(function_call.args, "items"):
                 for k, v in function_call.args.items():
+                    for_queue = {k: v}
                     tool_args[k] = v
+                    self.tool_args_to_queue_in_string(for_queue)
+                
             else:
                 # Fallback if it's a string
                 args_str = str(function_call.args)
@@ -285,7 +351,7 @@ class MCPClient:
             # Add to messages history
             result_content = result.content if hasattr(result, "content") else str(result)                           
             messages.append({
-                "role": "user", 
+                "role":   "user", 
                 "content": {"result": result_content}
             })
            
@@ -347,7 +413,9 @@ class MCPClient:
             except Exception as e:
                 print("Error:", str(e))
 
-    async def clenup(self):
+    # def credentials(self, username, password, email):
+
+    async def cleanup(self):
         """Clean up resources."""
         await self.exit_stack.aclose()
         if hasattr(self, '_session_context') and self._session_context:
@@ -355,16 +423,21 @@ class MCPClient:
         if hasattr(self, '_streams_context') and self._streams_context:
             await self._streams_context.__aexit__(None, None, None)
 
+    def get_signup_creds(self):
+        return getattr(self, "signup_creds", None)
 
-async def main():
+    def get_login_creds(self):
+        return getattr(self, "login_creds", None)
+
+async def run_mcp():
     client = MCPClient()
     try:
         await client.connect_to_server("http://localhost:8000/mcp")
         await client.chat_loop()
     finally:
-        await client.clenup()
+        await client.cleanup()
         print("\nMCP Client Closed!")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_mcp())
